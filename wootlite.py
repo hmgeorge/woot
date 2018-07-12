@@ -1,4 +1,8 @@
 import sys
+import threading
+import time
+import random
+from collections import deque
 
 
 class WChar:
@@ -129,8 +133,8 @@ class WString:
                               self.count[idx] - w_char)
             self.visible_count.insert(idx + 1,
                                       self.visible_count[idx] - p_char)
-            self.count.insert(idx, w_char + 1)
-            self.visible_count.insert(idx, p_char + 1)
+            self.count[idx] = w_char + 1
+            self.visible_count[idx] = p_char + 1
 
     def ithVisibleLinear(self, i, start_offset=0):
         assert(i >= 0 and i < len(self.wchars))
@@ -156,6 +160,7 @@ class WString:
         assert(i >= 0)
         # now find ith visible char in self.wchars, starting
         # at offset count_uptil
+        # count_uptil = 0
         return self.ithVisibleLinear(i, count_uptil)
 
     def integrateInsImpl(self, wc, p_idx, n_idx):
@@ -204,7 +209,11 @@ class WString:
                                        wc.alpha,
                                        cn.identifier[0],
                                        cn.identifier[1]])
-        sys.stderr.write("%s \n" % (op))
+        self.log("%s I %s, %s, %s, %s" % (hex(id(self)),
+                                          cp.identifier,
+                                          wc.identifier,
+                                          repr(wc.alpha),
+                                          cn.identifier))
         return op
 
     def integrateRemoteIns(self, wc):
@@ -219,10 +228,10 @@ class WString:
                 break
             if self.wchars[count_uptil + i].visible:
                 nv += 1
-        sys.stderr.write("RI %s %s %d @ pos %d before %s\n" %
-                         (str(wc.identifier),
-                          repr(wc.alpha), n_idx,
-                          nv - 1, repr(self.wchars[n_idx+1].alpha)))
+        self.log("%s RI %s %s @ pos %d before %s (%s)" %
+                 (hex(id(self)), str(wc.identifier),
+                  repr(wc.alpha), nv - 1, str(self.wchars[n_idx+1].identifier),
+                  repr(self.wchars[n_idx+1].alpha)))
         self.putIndex(wc.alpha, n_idx, nv)
         return wc.alpha, nv - 1
 
@@ -230,7 +239,22 @@ class WString:
         idx = self.findById(cid)
         assert(self.wchars[idx] != kBegin and
                self.wchars[idx] != kEnd)
-        assert(self.wchars[idx].visible)
+        if not self.wchars[idx].visible:
+            """
+            seed(16)
+            I,2,3,2,6,\n,2,5
+            RI (2, 6) '\n' 9 @ pos 3 before '\n'
+            RI (1, 5) 'y' 6 @ pos 1 before 'c'
+            I,2,5,1,6,y,32768,0
+            D,2,3 ('c')
+            RD (2, 3) 'c' @ pos 2, idx 8
+            RI (1, 6) 'y' 11 @ pos 4 before '\n'
+            D,2,6 ('\n')
+            D,2,6 ('\n') <--- !!!
+            """
+            sys.stderr.write(
+                "%s err exact char was already deleted?\n" % (hex(id(self))))
+            return -1  # TBD
         # pos = reduce(lambda c, w: c + 1 if w.visible else 0,
         #             self.wchars[:idx+1], -1)
         pos = 0
@@ -244,13 +268,14 @@ class WString:
                 break
             if self.wchars[count_uptil + i].visible:
                 nv += 1
-        assert(pos == nv)
+        if pos != nv:
+            sys.stderr.write("BUG! \n")
+        self.log("%s RD %s %s @ pos %d, idx %d" %
+                 (hex(id(self)), str(self.wchars[idx].identifier),
+                  repr(self.wchars[idx].alpha), pos - 1, idx))
         self.visible_count[str_idx] -= 1
         assert(self.visible_count[str_idx] >= 0)
         self.wchars[idx].visible = False
-        sys.stderr.write("RD %s %s @ pos %d, idx %d\n" %
-                         (str(self.wchars[idx].identifier),
-                          repr(self.wchars[idx].alpha), pos - 1, idx))
         # delete wc.alpha in the document *before*
         # the (visible) idx pos.
         # However, reduce pos by 1 as begin need not be returned
@@ -261,21 +286,30 @@ class WString:
         # Increment to account for kBegin
         pos += 1
         idx = self.ithVisible(pos)
-        str_idx, _ = WString.index_for(idx, self.count)
-        self.visible_count[str_idx] -= 1
-        assert(self.visible_count[str_idx] >= 0)
-        self.wchars[idx].visible = False
+        if self.wchars[idx] == kEnd:
+            return ''
         # shouldn't idenitifer be sent for both ins and del
         # paper doesn't make it explicit
         identifier = self.wchars[idx].identifier
         op = ','.join(str(x) for x in ['D',
                                        identifier[0],
                                        identifier[1]])
-        sys.stderr.write("%s (%s)\n" % (op, repr(self.wchars[idx].alpha)))
+        self.log("%s %s (%s) at pos %d" % (hex(id(self)), op,
+                                           repr(self.wchars[idx].alpha),
+                                           pos - 1))
+        str_idx, _ = WString.index_for(idx, self.count)
+        self.visible_count[str_idx] -= 1
+        assert(self.visible_count[str_idx] >= 0)
+        self.wchars[idx].visible = False
         return op
 
     def cmp(self, c, d):
         return self.pos(c) <= self.pos(d)
+
+    def log(self, msg):
+        # counts = ', '.join(str(n)+'/'+str(d) for n, d in zip(self.count,
+        #                                                     self.visible_count))
+        sys.stderr.write("%s \n" % (msg))
 
 
 class WootNote:
@@ -283,16 +317,22 @@ class WootNote:
         self.wstring = WString()
         self.site = site
         self.clock = clock
+        self.history = []
 
     def generateIns(self, pos, alpha):
         self.clock += 1
-        return self.wstring.integrateIns((self.site, self.clock),
-                                         alpha, pos)
+        ins_str = self.wstring.integrateIns((self.site, self.clock),
+                                            alpha, pos)
+        self.history.append(ins_str)
+        return ins_str
 
     def generateDel(self, pos):
-        return self.wstring.integrateDel(pos)
+        del_str = self.wstring.integrateDel(pos)
+        self.history.append(del_str)
+        return del_str
 
     def remoteIns(self, ins_str):
+        self.history.append(ins_str)
         # I,cp_site,cp_clock,c_site,c_clock,alpha,cn_site,cn_clock\n
         ins_op = ins_str.rstrip('\n').split(',')
         id_cp = (int(ins_op[1]), int(ins_op[2]))
@@ -302,6 +342,7 @@ class WootNote:
         return self.wstring.integrateRemoteIns(wch)
 
     def remoteDel(self, del_str):
+        self.history.append(del_str)
         # D,cp_site,cp_clock\n
         del_op = del_str.rstrip('\n').split(',')
         return self.wstring.integrateRemoteDel((int(del_op[1]),
@@ -309,6 +350,76 @@ class WootNote:
 
     def value(self):
         return self.wstring.value()
+
+    def replay(self):
+        for h in self.history:
+            sys.stderr.write("%s" % (h))
+
+
+class WootThread(threading.Thread):
+    def __init__(self, site):
+        threading.Thread.__init__(self)
+        self.wootNote = WootNote(site, 0)
+        self.queue = deque()
+        self.otherQueue = None
+
+    def run(self):
+        # chars = 'abcdefghijklmnopqrstuvwxyz\n'
+        chars = 'abcxyz\n\n\n\n'
+        done = False
+        exitPending = False
+        visible_count = 0
+        while not done:
+            time.sleep(0.1)
+            while len(self.queue) != 0:
+                op = self.queue.popleft()
+                if op[0] == 'I':
+                    self.wootNote.remoteIns(op)
+                    visible_count += 1
+                elif op[0] == 'D':
+                    self.wootNote.remoteDel(op)
+                    visible_count -= 1
+                elif op[0] == 'q':
+                    exitPending = True
+                elif op[0] == 'Q':
+                    done = True
+            if exitPending:
+                continue  # when exit is pending, don't generate
+            # simulate ins or del randomly if vis_count > 0
+            # vis count is incremented after insert.
+            if visible_count == 0:
+                op = 0
+                pos = 0
+            else:
+                op = random.randint(0, 1)
+                pos = random.randint(0, visible_count)
+            if op == 0:
+                alpha = chars[random.randint(0, len(chars)-1)]
+                op_str = self.wootNote.generateIns(pos, alpha)
+            else:
+                op_str = self.wootNote.generateDel(pos)
+            if op_str != '':
+                visible_count = visible_count + (1 if op == 0 else -1)
+                self.otherQueue.append(op_str)
+
+
+def concurrent_test(seed=17):
+    random.seed(seed)
+    wt1 = WootThread(1)
+    wt2 = WootThread(2)
+    wt1.otherQueue = wt2.queue
+    wt2.otherQueue = wt1.queue
+    wt1.start()
+    wt2.start()
+    time.sleep(2)
+    wt1.queue.append('q')
+    wt2.queue.append('q')
+    time.sleep(1)
+    wt1.queue.append('Q')
+    wt2.queue.append('Q')
+    wt1.join()
+    wt2.join()
+    return repr(wt1.wootNote.value()) == repr(wt2.wootNote.value())
 
 
 def prettyprint(wn):
